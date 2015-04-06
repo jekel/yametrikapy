@@ -12,7 +12,17 @@
 # Licence:     MIT
 #-------------------------------------------------------------------------------
 
-import json
+from simplejson import loads, dumps
+import datetime
+
+
+def _json_format(obj):
+    if isinstance(obj, (datetime.datetime, datetime.date)):
+        return obj.isoformat()
+    return None
+
+dumps = lambda data: dumps(data, use_decimal=True, default=_json_format)
+
 
 from client import APIClient
 
@@ -30,9 +40,11 @@ class UnauthorizedError(ClientError):
     """ 401 http-status """
     pass
 
+
 class ForbiddenError(ClientError):
     """ 403 http-status """
     pass
+
 
 class MethodNotAllowedError(ClientError):
     """ 405 http-status """
@@ -40,20 +52,143 @@ class MethodNotAllowedError(ClientError):
 
 
 class APIException(Exception):
-    pass
+    def __init__(self, msg, code=None):
+        self.message = msg
+        self.code = code
+
+    def __repr__(self):
+        return '<APIException: %s, code %s>' % (self.message.encode('utf-8'), self.code)
+
+    __str__ = __repr__
+
+
+class Dict2obj(object):
+    def __init__(self, dct):
+        self.__dict__ = dct
 
 
 class JSON2Obj(object):
     def __init__(self, page):
-        self.__dict__ = json.loads(page)
+        self.__dict__ = loads(page)
 
 
-class Metrika(object):
+class BaseMetrika(object):
+    OAUTH_TOKEN = 'https://oauth.yandex.ru/token'
+    _UserAgent = 'yametrikapy'
+
+    def __init__(self, client_id, username='', password='', token='', code=''):
+        self._ClientId = client_id
+        self._Username = username
+        self._Password = password
+        self._Token = token
+        self._Code = code
+
+        self._client = APIClient()
+        self._client.UserAgent = self._UserAgent
+        self._data = ''
+
+    @property
+    def UserAgent(self):
+        return self._UserAgent
+
+    @UserAgent.setter
+    def UserAgent(self, user_agent):
+        self._UserAgent = user_agent
+
+    def _GetResponseObject(f):
+        """
+        """
+        def wrapper(self):
+            # lets make dict from json
+            obj = loads(self._data)
+            if 'errors' in obj:
+                if len(obj['errors']) == 1:
+                    if isinstance(self, MetrikaV1):
+                        raise APIException(obj['errors'][0]['error_type'], obj['errors'][0].get('message') or obj['code'])
+                    raise APIException(obj['errors'][0]['text'], obj['errors'][0]['code'])
+                raise APIException('\n'.join([error['text'] for error in obj['errors']]))
+            if 'error' in obj:
+                raise APIException(obj['error'], obj['code'])
+
+            return f(self, obj)
+        return wrapper
+
+    @_GetResponseObject
+    def _AuthorizeHandle(self, obj):
+        # obj - dict from yandex json response
+        if 'access_token' in obj:
+            self._Token = obj['access_token']
+
+    def _Authorize(self):
+        params = {
+            'grant_type': 'authorization_code' if self._Code else 'password',
+            'client_id': self._ClientId
+        }
+        if self._Code:
+            params['code'] = self._Code
+        else:
+            params['username'] = self._Username
+            params['password'] = self._Password
+        self._data = self._client.Request('POST', self.OAUTH_TOKEN, params=params)
+        self._AuthorizeHandle()
+
+    def _Auth(f):
+        def wrapper(self, *args, **kwargs):
+            if not self._Token:
+                self._Authorize()
+            return f(self, *args, **kwargs)
+        return wrapper
+
+    def _GetHeaders(self):
+        header = {
+            'User-Agent': self._UserAgent,
+            'Accept': 'application/x-yametrika+json',
+            'Accept-Language': 'ru,en-us;q=0.7,en;q=0.3',
+            'Accept-Encoding': 'gzip,deflate',
+            'Accept-Charset': 'utf-8;q=0.7,*;q=0.7',
+            'Keep-Alive': '300',
+            'Connection': 'keep-alive',
+            'Authorization': 'OAuth %s' % self._Token
+        }
+        return header
+
+    @_Auth
+    def _GetData(self, method, uri, params={}):
+        headers = self._GetHeaders()
+        self._data = self._client.Request(method, uri, params=params, headers=headers)
+        if self._client.Status == 400:
+            raise BadRequestError('%d %s' % (self._client.Status, 'Check your request'))
+        if self._client.Status == 401:
+            raise UnauthorizedError('%d: %s' % (self._client.Status, 'Check your token'))
+        if self._client.Status == 403:
+            raise ForbiddenError('%d: %s' % (self._client.Status, 'Check your access rigths to object'))
+        if self._client.Status == 405:
+            allowed = self._client.GetHeader('Allowed')
+            raise MethodNotAllowedError('%d: %s\nUse %s' % (self._client.Status, 'Method not allowed', allowed))
+        return self._ResponseHandle()
+
+    _GetResponseObject = staticmethod(_GetResponseObject)
+
+
+class MetrikaV1(BaseMetrika):
+    """
+    Class for the V1 version of Yandex Metrika
+    """
+    HOST = 'https://beta.api-metrika.yandex.ru'
+
+    def getDS(self, **params):
+        return self._GetData('GET', self.HOST + '/stat/v1/data', params)
+
+    @BaseMetrika._GetResponseObject
+    def _ResponseHandle(self, dct):
+        return dct
+
+
+class Metrika(BaseMetrika):
     """
     Class for the API of Yandex Metrika
     """
     HOST = 'https://api-metrika.yandex.ru/'
-    OAUTH_TOKEN = 'https://oauth.yandex.ru/token'
 
     _COUNTERS = 'counters'
     _COUNTER = 'counter/%d'
@@ -115,104 +250,11 @@ class Metrika(object):
     _STAT_TECH_COOKIES = _STAT_TECH + '/cookies'
     _STAT_TECH_JAVASCRIPT = _STAT_TECH + '/javascript'
 
-    _UserAgent = 'yametrikapy'
-
-    @property
-    def UserAgent(self):
-        return self._UserAgent
-
-    @UserAgent.setter
-    def UserAgent(self, user_agent):
-        self._UserAgent = user_agent
-
-    def __init__(self, client_id, username='', password='', token='', code=''):
-        self._ClientId = client_id
-        self._Username = username
-        self._Password = password
-        self._Token = token
-        self._Code = code
-
-        self._client = APIClient()
-        self._client.UserAgent = self._UserAgent
-        self._data = ''
-
-    def _GetResponseObject(f):
-        """
-        """
-        def wrapper(self):
-            obj = JSON2Obj(self._data)
-            if hasattr(obj, 'errors'):
-                raise APIException('\n'.join([error['text']
-                    for error in obj.errors]))
-            if hasattr(obj, 'error'):
-                raise APIException(obj.error)
-            return f(self, obj)
-
-        return wrapper
-
-    @_GetResponseObject
-    def _AuthorizeHandle(self, obj):
-        if hasattr(obj, 'access_token'):
-            self._Token = obj.access_token
-
-    def _Authorize(self):
-        params = {
-            'grant_type': 'authorization_code' if self._Code else 'password',
-            'client_id': self._ClientId
-        }
-        if self._Code:
-            params['code'] = self._Code
-        else:
-            params['username'] = self._Username
-            params['password'] = self._Password
-        self._data = self._client.Request('POST', self.OAUTH_TOKEN,
-            params=params)
-        self._AuthorizeHandle()
-
-    def _Auth(f):
-        def wrapper(self, *args, **kwargs):
-            if not self._Token:
-                self._Authorize()
-            return f(self, *args, **kwargs)
-        return wrapper
-
-    def _GetHeaders(self):
-        header = {
-            'User-Agent': self._UserAgent,
-            'Accept': 'application/x-yametrika+json',
-            'Accept-Language': 'ru,en-us;q=0.7,en;q=0.3',
-            'Accept-Encoding': 'gzip,deflate',
-            'Accept-Charset': 'utf-8;q=0.7,*;q=0.7',
-            'Keep-Alive': '300',
-            'Connection': 'keep-alive',
-            'Authorization': 'OAuth %s' % self._Token
-        }
-        return header
-
-    @_GetResponseObject
-    def _ResponseHandle(self, obj):
+    @BaseMetrika._GetResponseObject
+    def _ResponseHandle(self, dct):
+        # lets make object from yandex response dict
+        obj = Dict2obj(dct)
         return obj
-
-    @_Auth
-    def _GetData(self, method, uri, params={}):
-        headers = self._GetHeaders()
-        self._data = self._client.Request(method, uri, params=params,
-            headers=headers)
-        if self._client.Status == 400:
-            raise BadRequestError(
-                '%d %s' % (self._client.Status, 'Check your request'))
-        if self._client.Status == 401:
-            raise UnauthorizedError(
-                '%d: %s' % (self._client.Status, 'Check your token'))
-        if self._client.Status == 403:
-            raise ForbiddenError(
-                '%d: %s' % (self._client.Status, 'Check your access rigths to object'))
-        if self._client.Status == 405:
-            allowed = self._client.GetHeader('Allowed')
-            raise MethodNotAllowedError(
-                '%d: %s\nUse %s' %
-                    (self._client.Status, 'Method not allowed', allowed))
-        return self._ResponseHandle()
 
     def _GetURI(self, methodname, params=''):
         uri = '%s%s.json' % (self.HOST, methodname)
@@ -254,7 +296,7 @@ class Metrika(object):
         kwargs['name'] = name
         kwargs['site'] = site
         params = {'counter': kwargs}
-        return self._GetData('POST', uri, json.dumps(params))
+        return self._GetData('POST', uri, dumps(params))
 
     def EditCounter(self, id, **kwargs):
         """
@@ -262,7 +304,7 @@ class Metrika(object):
         """
         uri = self._GetURI(self._COUNTER % id)
         params = {'counter': kwargs}
-        return self._GetData('PUT', uri, json.dumps(params))
+        return self._GetData('PUT', uri, dumps(params))
 
     def DeleteCounter(self, id):
         """
@@ -301,7 +343,7 @@ class Metrika(object):
                 'conditions': conditions
             }
         }
-        return self._GetData('POST', uri, json.dumps(params))
+        return self._GetData('POST', uri, dumps(params))
 
     def EditCounterGoal(self, id, goal_id, name, type, depth, conditions=[],
         flag=''):
@@ -318,7 +360,7 @@ class Metrika(object):
                 'flag': flag
             }
         }
-        return self._GetData('PUT', uri, json.dumps(params))
+        return self._GetData('PUT', uri, dumps(params))
 
     def DeleteCounterGoal(self, id, goal_id):
         """
@@ -357,7 +399,7 @@ class Metrika(object):
                 'status': status
             }
         }
-        return self._GetData('POST', uri, json.dumps(params))
+        return self._GetData('POST', uri, dumps(params))
 
     def EditCounterFilter(self, id, filter_id, action, attr, type, value,
         status):
@@ -374,7 +416,7 @@ class Metrika(object):
                 'status': status
             }
         }
-        return self._GetData('PUT', uri, json.dumps(params))
+        return self._GetData('PUT', uri, dumps(params))
 
     def DeleteCounterFilter(self, id, filter_id):
         """
@@ -412,7 +454,7 @@ class Metrika(object):
                 'status': status
             }
         }
-        return self._GetData('POST', uri, json.dumps(params))
+        return self._GetData('POST', uri, dumps(params))
 
     def EditCounterOperation(self, id, operation_id, action, attr, value,
         status):
@@ -428,7 +470,7 @@ class Metrika(object):
                 'status': status
             }
         }
-        return self._GetData('PUT', uri, json.dumps(params))
+        return self._GetData('PUT', uri, dumps(params))
 
     def DeleteCounterOperation(self, id, operation_id):
         """
@@ -466,7 +508,7 @@ class Metrika(object):
                 'user_login': user_login
             }
         }
-        return self._GetData('POST', uri, json.dumps(params))
+        return self._GetData('POST', uri, dumps(params))
 
     def EditCounterGrant(self, id, user_login, perm):
         """
@@ -479,7 +521,7 @@ class Metrika(object):
                 'perm': perm
             }
         }
-        return self._GetData('PUT', uri, json.dumps(params))
+        return self._GetData('PUT', uri, dumps(params))
 
     def DeleteCounterGrant(self, id, user_login):
         """
@@ -508,7 +550,7 @@ class Metrika(object):
                 'user_login': user_login
             }
         }
-        return self._GetData('POST', uri, json.dumps(params))
+        return self._GetData('POST', uri, dumps(params))
 
     def EditDelegates(self, delegates):
         """
@@ -516,7 +558,7 @@ class Metrika(object):
         """
         uri = self._GetURI(self._DELEGATES)
         params = {'delegates': delegates}
-        return self._GetData('PUT', uri, json.dumps(params))
+        return self._GetData('PUT', uri, dumps(params))
 
     def DeleteDelegate(self, user_login):
         """
@@ -549,7 +591,7 @@ class Metrika(object):
         """
         uri = self._GetURI(self._ACCOUNTS)
         params = {'accounts': accounts}
-        return self._GetData('PUT', uri, json.dumps(params))
+        return self._GetData('PUT', uri, dumps(params))
 
     def DeleteAccount(self, user_login):
         """
@@ -696,7 +738,7 @@ class Metrika(object):
                 params['goal_id'] = goal_id
         return self._GetData('GET', uri, params)
 
-    def GetStatSourcesPhrases(self, id, goal_id=None, se_id=None, date1='',
+    def GetStatSourcesPhrases(self, counter_id, goal_id=None, se_id=None, date1='',
         date2='', per_page=100, sort='visits', reverse=1, next=''):
         """
         Returns information about the search phrases that visitors find
@@ -707,11 +749,12 @@ class Metrika(object):
         params = {}
         if not next:
             params = {
-                'id': id,
+                'id': counter_id,
                 'date1': date1,
                 'date2': date2,
                 'sort': sort,
-                'reverse': reverse
+                'reverse': reverse,
+                'per_page': per_page
             }
             if not goal_id is None:
                 params['goal_id'] = goal_id
