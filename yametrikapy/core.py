@@ -27,6 +27,10 @@ dumps = lambda data: dumps(data, use_decimal=True, default=_json_format)
 from client import APIClient
 
 
+class BaseClass(object):
+    pass
+
+
 class ClientError(Exception):
     pass
 
@@ -108,6 +112,8 @@ class BaseMetrika(object):
                     raise APIException(obj['errors'][0]['text'], obj['errors'][0]['code'])
                 raise APIException('\n'.join([error['text'] for error in obj['errors']]))
             if 'error' in obj:
+                if obj['error'] == 'invalid_client':
+                    raise UnauthorizedError
                 raise APIException(obj['error'], obj['code'])
 
             return f(self, obj)
@@ -176,8 +182,33 @@ class MetrikaV1(BaseMetrika):
     """
     HOST = 'https://beta.api-metrika.yandex.ru'
 
+    def __init__(self, token):
+        super(MetrikaV1, self).__init__('', token=token)
+
     def getDS(self, **params):
         return self._GetData('GET', self.HOST + '/stat/v1/data', params)
+
+    def GetCounterList(self, **params):
+        """
+        https://tech.yandex.ru/metrika/doc/beta/management/counters/counters-docpage/
+        """
+        data = self._GetData('GET', self.HOST + '/management/v1/counters', params)
+        if data['rows'] > 0:
+            return data['counters']
+
+        return []
+
+    def GetCounter(self, counter_id, field=''):
+        """
+        https://tech.yandex.ru/metrika/doc/beta/management/counters/counter-docpage/
+
+        field - Один или несколько дополнительных параметров возвращаемого объекта.
+        Названия дополнительных параметров указываются в любом порядке через запятую, без пробелов.
+        Например: field=goals,mirrors,grants,filters,operation
+        """
+        data = self._GetData('GET', self.HOST + '/management/v1/counter/%d' % counter_id, {'field': field})
+        return data['counter']
+
 
     @BaseMetrika._GetResponseObject
     def _ResponseHandle(self, dct):
@@ -278,7 +309,17 @@ class Metrika(BaseMetrika):
             'ulogin': ulogin,
             'field': field
         }
-        return self._GetData('GET', uri, params)
+        obj = self._GetData('GET', uri, params)
+
+        result = BaseClass()
+        result.counters = []
+        result.counters.extend(obj.counters)
+
+        while hasattr(obj, 'links') and 'next' in obj.links:
+            obj = self._GetData('GET', obj.links['next'])
+            result.counters.extend(obj.counters)
+
+        return result
 
     def GetCounter(self, id, field=''):
         """
